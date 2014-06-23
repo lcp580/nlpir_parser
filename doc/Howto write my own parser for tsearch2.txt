@@ -1,0 +1,358 @@
+Howto write my own parser for tsearch2
+http://www.sai.msu.su/~megera/postgres/gist/tsearch/V2/docs/HOWTO-parser-tsearch2.html
+This how-to was written by Valli.
+First of all, let's give a look at the table pg_ts_parser:
+CREATE TABLE pg_ts_parser (
+	prs_name	text not null primary key,
+	prs_start	regprocedure not null,
+	prs_nexttoken	regprocedure not null,
+	prs_end		regprocedure not null,
+	prs_headline	regprocedure not null,
+	prs_lextype	regprocedure not null,
+	prs_comment	text
+) with oids;
+If we want to create a new parser, we have to insert a new record into this table. We could do it in the following way.
+INSERT INTO pg_ts_parser SELECT
+	'testparser',
+	'testprs_start(internal,int4)',
+	'testprs_getlexeme(internal,internal,internal)',
+	'testprs_end(internal)', 
+	'testprs_headline(internal,internal,internal)',
+	'testprs_lextype(internal)',
+	'Testparser v0.03'
+;
+As you see we have to create the following procedures before:
+testprs_start(internal,int4):
+
+Desc:
+  Initialises the parser.
+Interface:
+  1. Argument:  C-Type: (char *)          (IN)
+     Desc: Pointer to the text which we parse
+  2. Argument:  C-type: (int)             (IN)
+     Desc: length of the text
+Return value:
+  PG_RETURN_POINTER(pst) where pst is a pointer to our
+     selfdefined struct, which contains the parser state
+     (let's name it ParserState, so pst is of the type
+      (ParserState *))
+testprs_getlexeme(internal,internal,internal):
+
+Desc:
+  Returns the next token. This procedure will be
+  called so long as the procedure return type=0
+Interface:
+  1. Argument.  C-Type: (ParserState *)   (INOUT)
+  2. Argument:  C-Type: (char **)         (OUT)
+     Desc: token text
+  3. Argument:  C-type: (int *)           (OUT)
+     Desc: length of the token text
+Return value:
+     PG_RETURN_INT32(type);
+     Desc: token type
+testprs_end(internal):
+
+Desc:
+  Will be called after parsing is finished. We
+  have to free our allocated resources in this
+  procedure (ParserState).
+Interface:
+  1. Argument.  C-Type: (ParserState *)   (INOUT)
+Return value:
+     PG_RETURN_VOID();
+testprs_headline(internal,internal,internal):
+
+Desc:
+  Generates headline.
+Interface:
+  1. Argument.  C-Type: (HLPRSTEXT *)  (INOUT)
+     Desc: the parsed text (done by hlparsetext)
+  2. Argument:  C-Type: (text *)       (IN)
+     Desc: the options string of the headline command
+  3. Argument:  C-type: (QUERYTYPE *)  (IN)
+     Desc: the query (usually done by to_tsquery)
+Return value:
+     PG_RETURN_POINTER(prs) where prs is of C-type (HLPRSTEXT *)
+testprs_lextype(internal):
+
+Desc:
+  Returns an array containing the id, alias and the description of
+  the tokens of our parser.
+Interface:
+  1. Argument.  C-Type: ??? unused ???
+Return value:
+     PG_RETURN_POINTER(descr) where descr is of C-type (LexDescr *)
+About the non-std C-types:
+
+HLPRSTEXT     is defined in ts_cfg.h   (a tsearch2 headerfile)
+QUERYTYPE     is defined in query.h    (a tsearch2 headerfile)
+LexDescr      is defined in wparser.h  (a tsearch2 headerfile)
+ParserState   is defined by ourselves
+text          is defined c.h (it's a postgres type; will be included by postgres.h)
+So let's do a simple example which recognises space delimited words. It has only two types (3, word, Word; 12, blank, Space symbols). We will use the headline function of Teodor's default parser, which works very well for almost every parser. We can do this, because the headline function calls our parsing functions Actually this function is exactly that what we need for our example. If you want to write your own headline function, you'll find some notes from Teodor at the end.
+--------------------------------------------------------------------------------
+- test_parser.c
+--------------------------------------------------------------------------------
+/*
+ * testparser v0.02
+ */
+
+#include 
+#include 
+#include 
+
+#include "postgres.h"
+#include "utils/builtins.h"
+
+/*
+ * types
+ */
+
+/* self-defined type */
+typedef struct {
+  char *  buffer; /* text to parse */
+  int     len;    /* length of the text in buffer */
+  int     pos;    /* position of the parser */
+} ParserState;
+
+/* copy-paste from wparser.h of tsearch2 */
+typedef struct {
+  int     lexid;
+  char    *alias;
+  char    *descr;
+} LexDescr;
+
+/*
+ * prototypes
+ */
+PG_FUNCTION_INFO_V1(testprs_start);
+Datum testprs_start(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(testprs_getlexeme);
+Datum testprs_getlexeme(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(testprs_end);
+Datum testprs_end(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(testprs_lextype);
+Datum testprs_lextype(PG_FUNCTION_ARGS);
+
+/*
+ * functions
+ */
+Datum testprs_start(PG_FUNCTION_ARGS)
+{
+  ParserState *pst = (ParserState *) palloc(sizeof(ParserState));
+  pst->buffer = (char *) PG_GETARG_POINTER(0);
+  pst->len = PG_GETARG_INT32(1);
+  pst->pos = 0;
+
+  PG_RETURN_POINTER(pst);
+}
+
+Datum testprs_getlexeme(PG_FUNCTION_ARGS)
+{
+  ParserState *pst   = (ParserState *) PG_GETARG_POINTER(0);
+  char        **t    = (char **) PG_GETARG_POINTER(1);
+  int         *tlen  = (int *) PG_GETARG_POINTER(2);
+  int         type;
+
+  *tlen = pst->pos;
+  *t = pst->buffer +  pst->pos;
+
+  if ((pst->buffer)[pst->pos] == ' ') {
+    /* blank type */
+    type = 12;
+    /* go to the next non-white-space character */
+    while (((pst->buffer)[pst->pos] == ' ') && (pst->pos < pst->len)) {
+      (pst->pos)++;
+    }
+  } else {
+    /* word type */
+    type = 3;
+    /* go to the next white-space character */
+    while (((pst->buffer)[pst->pos] != ' ') && (pst->pos < pst->len)) {
+      (pst->pos)++;
+    }
+  }
+
+  *tlen = pst->pos - *tlen;
+  
+  /* we are finished if (*tlen == 0) */
+  if (*tlen == 0) type=0;
+
+  PG_RETURN_INT32(type);
+}
+
+Datum testprs_end(PG_FUNCTION_ARGS)
+{
+  ParserState *pst = (ParserState *) PG_GETARG_POINTER(0);
+  pfree(pst);
+  PG_RETURN_VOID();
+}
+
+Datum testprs_lextype(PG_FUNCTION_ARGS)
+{
+  /*
+    Remarks:
+    - we have to return the blanks for headline reason
+    - we use the same lexids like Teodor in the default
+      word parser; in this way we can reuse the headline
+      function of the default word parser.
+  */
+  LexDescr *descr = (LexDescr *) palloc(sizeof(LexDescr) * (2+1));
+
+  /* there are only two types in this parser */
+  descr[0].lexid = 3;
+  descr[0].alias = pstrdup("word");
+  descr[0].descr = pstrdup("Word");
+  descr[1].lexid = 12;
+  descr[1].alias = pstrdup("blank");
+  descr[1].descr = pstrdup("Space symbols");
+  descr[2].lexid = 0;
+
+  PG_RETURN_POINTER(descr);
+}
+
+--------------------------------------------------------------------------------
+- Makefile
+--------------------------------------------------------------------------------
+CC      = gcc
+CFLAGS  = -O3 -I. -I/usr/include/postgresql/server -Wall
+
+LIBS    =
+
+DEPENDS = test_parser.o
+
+test_parser.so.0: ${DEPENDS}
+        $(CC) $(CFLAGS) -shared -o $@ ${DEPENDS} ${LIBS}
+
+test_parser.o: test_parser.c
+        $(CC) $(CFLAGS) -c $*.c
+
+clean:
+        rm -f core core.* *.o *.a *~ *% *.so.*
+
+install:
+        cp -f test_parser.so.0 /usr/lib/postgresql/
+
+--------------------------------------------------------------------------------
+- test_parser.sql
+--------------------------------------------------------------------------------
+-- installing test parser
+CREATE FUNCTION testprs_start(internal,int4)
+	RETURNS internal
+	AS '$libdir/test_parser.so.0'
+	LANGUAGE 'C';
+
+CREATE FUNCTION testprs_getlexeme(internal,internal,internal)
+	RETURNS int4
+	AS '$libdir/test_parser.so.0'
+	LANGUAGE 'C';
+
+CREATE FUNCTION testprs_end(internal)
+	RETURNS void
+	AS '$libdir/test_parser.so.0'
+	LANGUAGE 'C';
+
+CREATE FUNCTION testprs_lextype(internal)
+	RETURNS internal
+	AS '$libdir/test_parser.so.0'
+	LANGUAGE 'C';
+
+INSERT INTO pg_ts_parser SELECT
+	'testparser',
+	'testprs_start(internal,int4)',
+	'testprs_getlexeme(internal,internal,internal)',
+	'testprs_end(internal)', 
+	'prsd_headline(internal,internal,internal)',
+	'testprs_lextype(internal)',
+	'Testparser v0.03'
+;
+
+INSERT INTO pg_ts_cfg SELECT
+	'testcfg',
+	'testparser',
+	NULL
+;
+
+INSERT INTO pg_ts_cfgmap SELECT
+	'testcfg',
+	'word',
+	'{simple}'
+;
+Howto install this example:
+
+Place test_parser.c, Makefile and test_parser.sql in a directory (let's say $dir)
+$dir > vi Makefile
+       -> change '/usr/lib/postgresql/' to your own $libdir
+       -> change '/usr/include/postgresql/server' to the
+          directory where postgres.h resides
+$dir > make
+$dir > make install (as root)
+$dir > psql -Upostgres yourdb
+yourdb=# \i $dir/test_parser.sql
+now it's ready to test it:
+yourdb=# SELECT * FROM parse('testparser','That''s my first own parser 4 tsearch2!');
+ tokid |   token   
+-------+-----------
+     3 | That's
+    12 |  
+     3 | my
+    12 |  
+     3 | first
+    12 |  
+     3 | own
+    12 |  
+     3 | parser
+    12 |  
+     3 | 4
+    12 |  
+     3 | tsearch2!
+(13 rows)
+
+yourdb=# SELECT to_tsvector('testcfg','That''s my first own parser 4 tsearch2!');
+                             to_tsvector                             
+---------------------------------------------------------------------
+ '4':6 'my':2 'own':4 'first':3 'parser':5 'that\'s':1 'tsearch2!':7
+(1 row)
+
+yourdb=# SELECT headline('testcfg', 'That''s my first own parser 4 tsearch2!', to_tsquery('testcfg', 'that''s'));
+                   headline                    
+-----------------------------------------------
+ That's my first own parser 4 tsearch2!
+(1 row)
+
+Some notes from Teodor for headline - writers:
+
+First give a look at wparser.c:headline(): The algorithm of this function is the follow:
+Fill HLPRSTEXT struct by just parsing the text and set links to text query's lexemes (hlparsetext)
+Parser-defined method should find relevant text part, removes (by setting flags) unneeded lexems and so on
+Generate text by genhl which use HLPRSTEXT struct.
+Sorry, but there isn't any docs about HLPRSTEXT struct. Some knowledge about HLWORD struct:
+typedef struct {
+    //lexeme length
+    uint16          len;
+
+    uint8
+        // lexeme should be selected (fooo)
+        selected:1,
+
+        //if 1, lexeme to be output
+        in:1,
+
+        //if 1 - skip. (this field will be erased in close future,
+        //because it repeats 'in' field :)
+        skip:1,
+
+        //lexeme should be replaced to space
+        replace:1,
+
+        //the same lexeme as previous but linked to other ITEM in query.
+        //it sets by hlparsetext
+        repeated:1;
+  
+        uint8      type;      //lexeme's type
+        char       *word;
+        ITEM       *item;     //pointer to query part
+}       HLWORD;

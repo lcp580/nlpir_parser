@@ -1,0 +1,4 @@
+comment = 'a parser for full-text search of Chinese with nlpir'
+default_version = '1.0'
+module_pathname = '$libdir/nlpir_parser'
+relocatable = true
